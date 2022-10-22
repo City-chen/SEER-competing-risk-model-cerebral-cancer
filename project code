@@ -1,0 +1,291 @@
+setwd("/Users/city/Library/CloudStorage/OneDrive-quartcollege/科研项目/2022.10.07-原发性脑癌患者的特异死亡率")
+train<-read.csv("train.csv")
+train<-train[,-1]
+test<-read.csv("test.csv")
+test<-test[,-1]
+
+train[,4:6]<-lapply(train[,4:6],as.numeric)
+train[,7:24]<-lapply(train[,7:24],as.factor)
+test[,4:6]<-lapply(test[,4:6],as.numeric)
+test[,7:24]<-lapply(test[,7:24],as.factor)
+
+
+library(tableone)
+train$index<-0
+test$index<-1
+data<-rbind(train,test)
+
+lapply(data[1:5000,4:6], shapiro.test)
+
+tab<-CreateTableOne(
+  vars = colnames(data[,2:24]),
+  factorVars = colnames(data[,c(3,7:24)]),
+  data = data
+)
+tab<-print(tab,
+           noSpaces = T,
+           nonnormal = T)
+
+tab2<-CreateTableOne(
+  vars = colnames(data[,2:24]),
+  factorVars = colnames(data[,c(3,7:24)]),
+  data = data,
+  strata = "index"
+)
+tab2<-print(tab2,
+            noSpaces = T,
+            nonnormal = T)
+tab<-cbind(tab,tab2)
+write.csv(tab,"description.csv")
+
+#one factor
+################################################################################
+library(plyr)
+library(riskRegression)
+library(survival)
+library(pec)
+
+dan1<-function(i){
+  fml<-as.formula(paste0(paste0("Hist(Time,Status)~",i)))
+  fgr<-FGR(fml,data = train,cause = 1)
+  fgrsum<-summary(fgr)
+  dan<-data.frame("Factors"=i,
+                  "Levels"=rownames(fgrsum$conf.int),
+                  "HR(95%CI)"=paste0(
+                    round(fgrsum$conf.int[,1],2),"(",
+                    round(fgrsum$conf.int[,3],2),"-",
+                    round(fgrsum$conf.int[,4],2),")"),
+                  "p"=round(fgrsum$coef[,5],4))
+  return(dan)
+}
+dan1<-ldply(lapply(colnames(train[,4:24]), dan1),data.frame)
+dan051<-dan1$Factors[which(dan1$p<=0.05)]
+dan051<-unique(dan051)
+
+#multiplicity 
+fml<-as.formula(paste0(paste0("Hist(Time,Status)~",paste0(dan051,collapse = "+"))))
+fgr<-FGR(fml,data = train,cause = 1)
+sfgr<-summary(fgr)
+duo1<-data.frame("Levels"=rownames(sfgr$conf.int),
+                "HR(95%CI)"=paste0(round(sfgr$conf.int[,1],2),"(",
+                                   round(sfgr$conf.int[,3],2),"-",
+                                   round(sfgr$conf.int[,4],2),")"),
+                "p"=round(sfgr$coef[,5],4))
+selection1<-merge(dan1,duo1,by="Levels",all.x = T)
+duo051<-unique(selection1$Factors[which(selection1$p.y<=0.05)])
+write.csv(selection1,"selection_fgr.csv")
+
+#model and nomograph
+fml2<-as.formula(paste0(paste0("Hist(Time,Status)~",paste0(duo051,collapse = "+"))))
+fgr2<-FGR(fml2,data = train,cause = 1)
+sfgr2<-summary(fgr2)
+sfgr2$conf.int
+fgr<-round(sfgr2$coef,4)
+write.csv(fgr,"model_fgr.csv")
+
+library(mstate)
+be.w <- crprep(Tstart = 0,"Time","Status",data = train,trans = c(1,2),cens = 0,id="ID",
+               keep = duo051)
+be.w$Time <- be.w$Tstop - be.w$Tstart
+
+library(rms)
+dd <- datadist(be.w)
+options(datadist = "dd")
+cfml<-as.formula(paste0(paste0("Surv(Tstart,Tstop,status==1)~",paste0(duo051,collapse = "+"))))
+f <- cph(cfml, x=T, y=T,  surv=T, data = be.w)
+surv <- Survival(f)
+nom1 <- nomogram(f, 
+                lp=F,
+                fun=list(function(x) surv(12, x),function(x) surv(36, x),function(x) surv(60, x)),
+                funlabel=c("1-year specific survival", "3-year specific survival", "5-year Specific survival"))
+par(mar=c(0.5,0.5,1,0)+0.1,xpd=TRUE)
+plot(nom1,
+     xfrac = .4,
+     cex.axis = 0.9,
+     cex.var = 0.9)
+
+#c-index
+fc <- coxph(cfml, data = be.w)
+sfc<-summary(fc)
+sfc$concordance
+
+#ROC
+################################################################################
+
+roc1_a <- Score(list('model1' = fgr2),
+             formula = Hist(Time,Status)~1,
+             data = train ,se.fit = 1L,times = c(12,36,60),plots = "ROC",metrics = "auc")
+roc1_b <- Score(list('model1' = fgr2),
+              formula = Hist(Time,Status)~1,
+              data = test ,se.fit = 1L,times = c(12,36,60),plots = "ROC",metrics = "auc")
+
+#校准曲线
+################################################################################################################################################################
+fgrc1_a <- FGR(Hist(Time, Status) ~ Age + Grade + Ki67.10 + Marital + 
+                 Site + Size + SystemicSurSeq,data=train,cause = 1)
+fgrc1_b <- FGR(Hist(Time, Status) ~ Age + Grade + Ki67.10 + Marital + 
+                 Site + Size + SystemicSurSeq,data=test,cause = 1)
+
+#FGR画图
+###########################################################
+par(mar=c(1,1,0,0)+3)
+par(mfrow=c(2,2))
+#train
+d <- as.data.frame(roc1_a$AUC$score)
+a <- d[d$times %in% c(12,36,60),]
+a$AUC_com <- paste(round(a$AUC,3),'(',round(a$lower,3),',',round(a$upper,3),')',sep='')
+col = c("red4","pink","tomato2")
+plotROC(roc1_a,xlab="1-Specificity",ylab="Sensitivity",col=col[1],legend="",cex=1,auc.in.legend = F,times = 12)
+plotROC(roc1_a,col = col[2],legend = '', cex=0.5,times = 36,auc.in.legend = F,add=T)
+plotROC(roc1_a,col = col[3], times = 60,  add=T, cex=0.5, legend = '',auc.in.legend = F)
+leg <- paste(c("1-year:","3-year:","5-year:"),a$AUC_com)
+legend("bottomright",legend=leg,cex = 1,bty='n',title='Training Set',col=col,lwd=3)
+#test
+d2 <- as.data.frame(roc1_b$AUC$score)
+a2 <- d2[d2$times %in% c(12,36,60),]
+a2$AUC_com <- paste(round(a2$AUC,3),'(',round(a2$lower,3),',',round(a2$upper,3),')',sep='')
+colors()
+col = c("red4","pink","tomato2")
+plotROC(roc1_b,xlab="1-Specificity",ylab="Sensitivity",col=col[1],legend="",cex=1,auc.in.legend = F,times = 12)
+plotROC(roc1_b,col = col[2],legend = '', cex=0.5,times = 36,auc.in.legend = F,add=T)
+plotROC(roc1_b,col = col[3], times = 60,  add=T, cex=0.5, legend = '',auc.in.legend = F)
+leg <- paste(c("1-year:","3-year:","5-year:"),a2$AUC_com)
+legend("bottomright",legend=leg,cex = 1,bty='n',title='Validation Set',col=col,lwd=3)
+
+
+#内
+calPlot(fgrc1_a,time = 12,xlim = c(0,1),ylim = c(0,1),col = "red4",legend = F,
+        xlab = "Predicted probability in training Set")
+calPlot(fgrc1_b,time = 36,xlim = c(0,1),ylim = c(0,1),col = "pink",add = T)
+calPlot(fgrc1_b,time = 60,xlim = c(0,1),ylim = c(0,1),col = "tomato2",add = T)
+legend("bottomright",legend=c("1-year","2-year","3-year"),col=c("red4","pink","tomato2"),lwd = 3,cex = 1,bty = 'n')
+
+#外
+calPlot(fgrc1_b,time = 12,xlim = c(0,1),ylim = c(0,1),col = "red4",legend = F,
+        xlab = "Predicted probability in validation Set")
+calPlot(fgrc1_b,time = 36,xlim = c(0,1),ylim = c(0,1),col = "pink",add = T)
+calPlot(fgrc1_b,time = 60,xlim = c(0,1),ylim = c(0,1),col = "tomato2",add = T)
+legend("bottomright",legend=c("1-year","2-year","3-year"),col=c("red4","pink","tomato2"),lwd = 3,cex = 1,bty = 'n')
+
+
+#COX
+###############################################################################
+train1<-train
+train1$Status[train1$Status==2]<-1
+test1<-test
+test1$Status[test1$Status==2]<-1
+#dan
+
+dan2<-function(i){
+  cfml<-as.formula(paste0("Surv(Time,Status)~",i))
+  cx<-coxph(cfml,data = train1)
+  scx<-summary(cx)
+  dan<-data.frame("Factors"=i,
+                  "Levels"=rownames(scx$coefficients),
+                  "HR(95%CI)"=paste0(round(scx$conf.int[,1],2),"(",round(scx$conf.int[,3],2),"-",round(scx$conf.int[,4],2),")"),
+                  "P"=round(scx$coefficients[,5],4))
+  return(dan)
+}
+dan2<-lapply(colnames(train1[,4:24]),dan2)
+dan2<-ldply(dan2,data.frame)
+dan052<-dan2$Factors[which(dan2$P<=0.05)]
+
+#duo
+cfml<-as.formula(paste0("Surv(Time,Status)~",paste0(unique(dan052),collapse = "+")))
+cox<-coxph(cfml,train1)
+stcox<-step(cox,direction="both")
+stcox1<-summary(stcox)
+duo2<-data.frame("Levels"=rownames(stcox1$coefficients),
+                "HR(95%CI)"=paste0(round(stcox1$conf.int[,1],2),"(",round(stcox1$conf.int[,3],2),"-",round(stcox1$conf.int[,4],2),")"),
+                "P"=round(stcox1$coefficients[,5],4))
+
+selection2<-merge(dan2,duo2,by="Levels",all.x = T)
+duo052<-selection2$Factors[which(selection2$P.y<=0.05)]
+write.csv(selection2,"selection_cox.csv")
+
+#
+cfml2<-as.formula(paste0("Surv(Time,Status)~",paste0(unique(duo052),collapse = "+")))
+cox<-coxph(cfml2,train1)
+scox<-summary(cox)
+sscox<-round(scox$coefficients,4)
+write.csv(sscox,"model_cox.csv")
+
+#c-index
+scox$concordance
+
+library(rms)
+dd <- datadist(train1)
+options(datadist="dd")
+cox<-cph(cfml2,
+         x=T,y=T,data = train1,surv = T)
+
+nom2 <- nomogram(cox, 
+                lp=F,
+                fun=list(function(x) surv(12, x),function(x) surv(36, x),function(x) surv(60, x)),
+                funlabel=c("1-year overall survival", "3-year overall survival", "5-year overall survival"))
+par(mar=c(0.5,0.5,1,0)+0.1,xpd=TRUE)
+plot(nom2,
+     xfrac = .4,
+     cex.axis = 0.9,
+     cex.var = 0.9)
+
+#ROC
+###############################################
+roc2_a <- Score(list('model1' = cox),
+             formula = Surv(Time,Status)~1,
+             data = train1 ,se.fit = 1L,times = c(12,36,60),plots = "ROC",metrics = "auc")
+
+roc2_b <- Score(list('model1' = cox),
+              formula = Surv(Time,Status)~1,
+              data = test1 ,se.fit = 1L,times = c(12,36,60),plots = "ROC",metrics = "auc")
+
+
+#校准曲线
+################################################################################################################################################################
+cox <- cph(Surv(Time, Status) ~ Age + Grade + Laterality + Marital + NumberBenign + 
+             Race + Sex + Site + Size + SummaryStage + Surgery,data=train1,surv=TRUE)
+cox2 <- cph(Surv(Time, Status) ~ Age + Grade + Laterality + Marital + NumberBenign + 
+              Race + Sex + Site + Size + SummaryStage + Surgery,data=test1,surv=TRUE)
+
+#COX画图
+par(mar=c(1,1,0,0)+3)
+par(mfrow=c(2,2))
+#train
+d <- as.data.frame(roc2_a$AUC$score)
+a <- d[d$times %in% c(12,36,60),]
+a$AUC_com <- paste(round(a$AUC,3),'(',round(a$lower,3),',',round(a$upper,3),')',sep='')
+col = c("red4","pink","tomato2")
+plotROC(roc2_a,xlab="1-Specificity",ylab="Sensitivity",col=col[1],legend="",cex=1,auc.in.legend = F,times = 12)
+plotROC(roc2_a,col = col[2],legend = '', cex=0.5,times = 36,auc.in.legend = F,add=T)
+plotROC(roc2_a,col = col[3], times = 60,  add=T, cex=0.5, legend = '',auc.in.legend = F)
+leg <- paste(c("1-year","3-year:","5-year:"),a$AUC_com)
+legend("bottomright",legend=leg,cex = 1,bty='n',title='Training Set',col=col,lwd=3)
+#test
+d2 <- as.data.frame(roc2_b$AUC$score)
+a2 <- d2[d2$times %in% c(12,36,60),]
+a2$AUC_com <- paste(round(a2$AUC,3),'(',round(a2$lower,3),',',round(a2$upper,3),')',sep='')
+col = c("red4","pink","tomato2")
+plotROC(roc2_b,xlab="1-Specificity",ylab="Sensitivity",col=col[1],legend="",cex=1,auc.in.legend = F,times = 12)
+plotROC(roc2_b,col = col[2],legend = '', cex=0.5,times = 36,auc.in.legend = F,add=T)
+plotROC(roc2_b,col = col[3], times = 60,  add=T, cex=0.5, legend = '',auc.in.legend = F)
+leg <- paste(c("1-year:","3-year:","5-year:"),a2$AUC_com)
+legend("bottomright",legend=leg,cex = 1,bty='n',title='Validation Set',col=col,lwd=3)
+
+#内
+calPlot(cox,time = 12,xlim = c(0,1),ylim = c(0,1),col = "red4",legend = F,
+        xlab = "Predicted probability in training Set")
+calPlot(cox,time = 36,xlim = c(0,1),ylim = c(0,1),col = "pink",add = T)
+calPlot(cox,time = 60,xlim = c(0,1),ylim = c(0,1),col = "tomato2",add = T)
+legend("bottomright",legend=c("1-year","2-year","3-year"),col=c("red4","pink","tomato2"),lwd = 3,cex = 1,bty = 'n')
+
+#外
+calPlot(cox2,time = 12,xlim = c(0,1),ylim = c(0,1),col = "red4",legend = F,
+        xlab = "Predicted probability in validation Set")
+calPlot(cox2,time = 36,xlim = c(0,1),ylim = c(0,1),col = "pink",add = T)
+calPlot(cox2,time = 60,xlim = c(0,1),ylim = c(0,1),col = "tomato2",add = T)
+legend("bottomright",legend=c("1-year","2-year","3-year"),col=c("red4","pink","tomato2"),lwd = 3,cex = 1,bty = 'n')
+
+
+write.csv(selection2,"/Users/city/Library/CloudStorage/OneDrive-quartcollege/科研项目/2022.10.07-原发性脑癌患者的特异死亡率/selection_cox.csv")
+
+
